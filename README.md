@@ -8,10 +8,27 @@ Use an Android phone as a wireless microphone for Ubuntu (PipeWire) over Wi-Fi. 
 - `android/` — Android app that captures the phone mic and streams it to the PC.
 - `web/` — Browser fallback if you do not want the APK.
 
-## Ubuntu receiver
+## Easy install (Ubuntu)
 
 ```bash
-python3 lanmic.py --default --http-port 8767
+curl -fsSL https://raw.githubusercontent.com/mahmoudhamdi26/lanmic/main/install.sh | bash
+```
+
+That creates a virtualenv, installs Python deps, and enables a systemd user service so LanMic starts at login.
+
+```bash
+systemctl --user status lanmic
+systemctl --user restart lanmic
+# remove the service only:
+# ~/.local/share/lanmic/install.sh --uninstall
+```
+
+## Ubuntu receiver (manual)
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python lanmic.py --default --http-port 8767
 ```
 
 Then pick **LanMic** as the input in Settings → Sound (and in Discord/OBS).

@@ -316,15 +316,21 @@ def install_service() -> None:
     unit_dir = Path.home() / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
     unit = unit_dir / "lanmic.service"
+    venv_python = ROOT / ".venv" / "bin" / "python"
+    python = str(venv_python if venv_python.exists() else Path(sys.executable).resolve())
     unit.write_text(
         f"""[Unit]
 Description=LanMic phone microphone
-After=pipewire.service
+After=pipewire.service pipewire-pulse.service
+Wants=pipewire.service
 
 [Service]
-ExecStart={sys.executable} {ROOT / "lanmic.py"} --default --http-port 8767
+Type=simple
+WorkingDirectory={ROOT}
+ExecStart={python} {ROOT / "lanmic.py"} --default --http-port 8767
 Restart=on-failure
 RestartSec=2
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=default.target
