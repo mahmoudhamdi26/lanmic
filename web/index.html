@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#071018">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>LanMic</title>
+  <link rel="manifest" href="/manifest.json">
+  <style>
+    :root {
+      --bg: #071018;
+      --card: #101a24;
+      --ink: #e8f1f8;
+      --muted: #8aa0b3;
+      --line: #1d2c3a;
+      --good: #3ee0a1;
+      --warn: #f5c14a;
+      --bad: #ff6b7a;
+      --accent: #4cc2ff;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--ink); font-family: Inter, "Segoe UI", Roboto, sans-serif; }
+    body {
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      padding: 24px 20px calc(24px + env(safe-area-inset-bottom));
+    }
+    header { display: flex; justify-content: space-between; align-items: center; }
+    .brand { font-weight: 700; letter-spacing: 0.04em; }
+    .pill {
+      font-size: 12px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: #13202c;
+      color: var(--muted);
+      border: 1px solid var(--line);
+    }
+    .pill.live { color: #06281c; background: var(--good); border-color: var(--good); }
+    .pill.wait { color: var(--warn); }
+    .pill.err { color: var(--bad); }
+    main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 28px; }
+    h1 { margin: 0; font-size: 28px; text-align: center; }
+    p { margin: 0; color: var(--muted); text-align: center; line-height: 1.45; max-width: 28rem; }
+    .mic {
+      width: 176px; height: 176px; border: 0; border-radius: 50%;
+      background: radial-gradient(circle at 40% 30%, #1c3346, #0d1a24 70%);
+      color: var(--ink); box-shadow: 0 0 0 12px #0d1c28, 0 20px 50px rgba(0,0,0,.35);
+      font-size: 18px; font-weight: 650; letter-spacing: .04em;
+    }
+    .mic.streaming {
+      background: radial-gradient(circle at 40% 30%, #1a4a38, #0d241c 70%);
+      box-shadow: 0 0 0 12px #103226, 0 0 60px rgba(62,224,161,.25);
+    }
+    .meter { width: min(280px, 80vw); height: 8px; background: #13202c; border-radius: 99px; overflow: hidden; }
+    .meter > span { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--good)); }
+    .card {
+      width: min(420px, 100%);
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px 16px;
+      display: grid;
+      gap: 8px;
+    }
+    .row { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; color: var(--muted); }
+    .row b { color: var(--ink); font-weight: 600; }
+    .toggles { display: grid; gap: 10px; width: min(420px, 100%); }
+    label { display: flex; justify-content: space-between; align-items: center; color: var(--muted); font-size: 14px; }
+    input[type=checkbox] { accent-color: var(--good); width: 18px; height: 18px; }
+    .hint { font-size: 13px; }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">LanMic</div>
+    <div id="state" class="pill wait">Idle</div>
+  </header>
+  <main>
+    <div>
+      <h1>Phone microphone</h1>
+      <p id="subtitle">This page streams your mic to Ubuntu over Wi‑Fi. No ads, no time limit, no Google Play.</p>
+    </div>
+    <button id="mic" class="mic" type="button">Start</button>
+    <div class="meter" aria-hidden="true"><span id="level"></span></div>
+    <div class="card">
+      <div class="row"><span>PC mic</span><b>LanMic</b></div>
+      <div class="row"><span>Link</span><b id="link">Disconnected</b></div>
+      <div class="row"><span>Rate</span><b id="rate">—</b></div>
+      <div class="row"><span>Sent</span><b id="sent">0 KB</b></div>
+    </div>
+    <div class="toggles">
+      <label>Echo cancellation <input id="echo" type="checkbox"></label>
+      <label>Noise suppression <input id="noise" type="checkbox"></label>
+      <label>Auto gain <input id="agc" type="checkbox" checked></label>
+    </div>
+    <p class="hint" id="hint">Use Chrome or Firefox. Keep this tab open while you talk. The green bar must move when you speak.</p>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const insecure = location.protocol !== "https:" && location.hostname !== "localhost" && location.hostname !== "127.0.0.1";
+    if (insecure) {
+      $("hint").innerHTML = "Phone browsers block the microphone on plain HTTP. Open the <b>HTTPS</b> address shown on the PC, accept the certificate warning, then tap Start.";
+    }
+
+    let running = false;
+    let stream, audioCtx, workletNode, scriptNode, source, ws, wakeLock, bytes = 0, raf;
+
+    const setState = (text, cls) => {
+      $("state").textContent = text;
+      $("state").className = "pill " + cls;
+    };
+
+    function floatToPcm(channels) {
+      const length = channels[0].length;
+      const pcm = new Int16Array(length);
+      let peak = 0;
+      for (let i = 0; i < length; i++) {
+        let s = 0;
+        for (let c = 0; c < channels.length; c++) s += channels[c][i];
+        s /= channels.length;
+        if (s > 1) s = 1; else if (s < -1) s = -1;
+        const a = Math.abs(s);
+        if (a > peak) peak = a;
+        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      return { pcm, peak };
+    }
+
+    function sendPcm(pcm, peak) {
+      if (!ws || ws.readyState !== 1) return;
+      bytes += pcm.byteLength;
+      ws.send(pcm.buffer);
+      $("level").style.width = Math.min(100, peak * 160) + "%";
+    }
+
+    async function openMic() {
+      const extras = {
+        echoCancellation: $("echo").checked,
+        noiseSuppression: $("noise").checked,
+        autoGainControl: $("agc").checked,
+      };
+      try {
+        return await navigator.mediaDevices.getUserMedia({ audio: extras, video: false });
+      } catch (err) {
+        return await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      }
+    }
+
+    async function hookWorklet(ctx, srcNode) {
+      const src = `
+        class LanMicProcessor extends AudioWorkletProcessor {
+          process(inputs) {
+            const input = inputs[0];
+            if (input && input[0] && input[0].length) {
+              const length = input[0].length;
+              const pcm = new Int16Array(length);
+              let peak = 0;
+              for (let i = 0; i < length; i++) {
+                let s = 0;
+                for (let c = 0; c < input.length; c++) s += input[c][i];
+                s /= input.length;
+                if (s > 1) s = 1; else if (s < -1) s = -1;
+                const a = Math.abs(s);
+                if (a > peak) peak = a;
+                pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+              }
+              this.port.postMessage({ pcm: pcm.buffer, peak }, [pcm.buffer]);
+            }
+            return true;
+          }
+        }
+        registerProcessor("lanmic-processor", LanMicProcessor);
+      `;
+      const blob = new Blob([src], { type: "application/javascript" });
+      const url = URL.createObjectURL(blob);
+      await ctx.audioWorklet.addModule(url);
+      URL.revokeObjectURL(url);
+      workletNode = new AudioWorkletNode(ctx, "lanmic-processor");
+      workletNode.port.onmessage = (ev) => sendPcm(new Int16Array(ev.data.pcm), ev.data.peak);
+      const silent = ctx.createGain();
+      silent.gain.value = 0.0001;
+      srcNode.connect(workletNode);
+      workletNode.connect(silent);
+      silent.connect(ctx.destination);
+    }
+
+    function hookScript(ctx, srcNode) {
+      scriptNode = ctx.createScriptProcessor(2048, 1, 1);
+      scriptNode.onaudioprocess = (ev) => {
+        const data = ev.inputBuffer.getChannelData(0);
+        const packed = floatToPcm([data]);
+        sendPcm(packed.pcm, packed.peak);
+      };
+      const silent = ctx.createGain();
+      silent.gain.value = 0.0001;
+      srcNode.connect(scriptNode);
+      scriptNode.connect(silent);
+      silent.connect(ctx.destination);
+    }
+
+    async function connect(rate) {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const socket = new WebSocket(`${proto}://${location.host}/ws`);
+      socket.binaryType = "arraybuffer";
+      await new Promise((resolve, reject) => {
+        socket.onopen = resolve;
+        socket.onerror = () => reject(new Error("WebSocket failed"));
+      });
+      socket.send(JSON.stringify({ type: "hello", rate, channels: 1 }));
+      return socket;
+    }
+
+    async function start() {
+      if (running) return;
+      setState("Starting", "wait");
+      $("hint").textContent = "Allow microphone access when the phone asks.";
+      stream = await openMic();
+      const track = stream.getAudioTracks()[0];
+      if (!track) throw new Error("No microphone track");
+      track.enabled = true;
+      audioCtx = new AudioContext({ latencyHint: "interactive" });
+      await audioCtx.resume();
+      source = audioCtx.createMediaStreamSource(stream);
+      try {
+        if (audioCtx.audioWorklet) await hookWorklet(audioCtx, source);
+        else hookScript(audioCtx, source);
+      } catch (err) {
+        hookScript(audioCtx, source);
+      }
+      ws = await connect(audioCtx.sampleRate);
+      ws.onclose = () => { if (running) stop("PC disconnected"); };
+      ws.onerror = () => { if (running) stop("Link error"); };
+      try { wakeLock = await navigator.wakeLock.request("screen"); } catch {}
+      running = true;
+      $("mic").textContent = "Stop";
+      $("mic").classList.add("streaming");
+      $("link").textContent = "Streaming";
+      $("rate").textContent = Math.round(audioCtx.sampleRate) + " Hz";
+      setState("Live", "live");
+      $("hint").textContent = "Speak now. If the bar does not move, the browser is not getting the mic.";
+      const tick = () => {
+        $("sent").textContent = (bytes / 1024).toFixed(0) + " KB";
+        if (running) raf = requestAnimationFrame(tick);
+      };
+      tick();
+    }
+
+    async function stop(reason) {
+      running = false;
+      cancelAnimationFrame(raf);
+      try { workletNode && workletNode.port && (workletNode.port.onmessage = null); } catch {}
+      try { if (scriptNode) scriptNode.onaudioprocess = null; } catch {}
+      try { workletNode && workletNode.disconnect(); } catch {}
+      try { scriptNode && scriptNode.disconnect(); } catch {}
+      try { source && source.disconnect(); } catch {}
+      try { stream && stream.getTracks().forEach((t) => t.stop()); } catch {}
+      try { audioCtx && audioCtx.close(); } catch {}
+      try { ws && ws.close(); } catch {}
+      try { wakeLock && wakeLock.release(); } catch {}
+      stream = audioCtx = workletNode = scriptNode = source = ws = wakeLock = null;
+      bytes = 0;
+      $("mic").textContent = "Start";
+      $("mic").classList.remove("streaming");
+      $("link").textContent = "Disconnected";
+      $("level").style.width = "0";
+      $("sent").textContent = "0 KB";
+      if (reason) {
+        setState("Error", "err");
+        $("hint").textContent = reason;
+      } else {
+        setState("Idle", "wait");
+        $("hint").textContent = "Stopped. Tap Start to stream again.";
+      }
+    }
+
+    $("mic").addEventListener("click", async () => {
+      try {
+        if (running) await stop();
+        else await start();
+      } catch (err) {
+        await stop(err.message || String(err));
+      }
+    });
+
+    document.addEventListener("visibilitychange", async () => {
+      if (document.visibilityState === "visible" && running) {
+        try { audioCtx && audioCtx.resume(); } catch {}
+        try { wakeLock = await navigator.wakeLock.request("screen"); } catch {}
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.LanMic" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="android:statusBarColor">#071018</item>
+        <item name="android:navigationBarColor">#071018</item>
+        <item name="android:windowBackground">#071018</item>
+        <item name="colorPrimary">#3EE0A1</item>
+    </style>
+</resources>

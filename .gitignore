@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.cxx/
+*.iml
+.idea/
+
+# Artifacts and local machine
+*.apk
+*.aab
+LanMic.apk
+*.log
+
+# TLS leftovers (generated on the PC)
+*.pem
