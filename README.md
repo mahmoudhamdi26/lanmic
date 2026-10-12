@@ -38,6 +38,8 @@ The phone app uses:
 - `ws://PC_IP:8767/ws` for control
 - HTTPS on port `8766` for the browser page
 
+Hub mode (Samox) adds `--auth-url`, `--stable-cert`, `--http-host 127.0.0.1`, and `--hub-uuid`. In that mode phones must pair and send a token in the hello frame. Discovery replies include `kind: samox_hub` and the certificate fingerprint.
+
 ## Android app
 
 Open `android/` in Android Studio, or build a debug APK:
@@ -50,7 +52,7 @@ cd android
 gradle assembleDebug
 ```
 
-Sideload the APK. In the app, set the PC IP (for example `192.168.8.81`) and port `8767`, then tap Start.
+Sideload the APK. On the same Wi-Fi as the PCs, open the app — it lists every running LanMic computer. Tap the one you want (desktop or Yoga), then Start. Port is `8767`. You can still type an IP by hand.
 
 ## License
 
