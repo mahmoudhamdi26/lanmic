@@ -677,10 +677,14 @@ class LanMicServer:
         await self.mic_handler(websocket)
 
     async def mic_handler(self, websocket: ServerConnection) -> None:
-        if self.active is not None:
-            await websocket.close(4000, "Another phone is already streaming")
-            return
+        previous = self.active
         self.active = websocket
+        if previous is not None and previous is not websocket:
+            print("Replacing the previous phone mic stream", flush=True)
+            try:
+                await previous.close(4000, "replaced")
+            except Exception:
+                pass
         rate = 48000
         device: dict[str, Any] = {}
         try:
@@ -738,29 +742,35 @@ class LanMicServer:
         except Exception as exc:
             print(f"Stream ended: {exc}", flush=True)
         finally:
-            if self.active is websocket:
+            if self.active is not websocket:
+                print("Previous phone mic stream released", flush=True)
+            else:
                 self.active = None
-            device = dict(self.active_device)
-            self.active_device = {}
-            await self.mic.stop_player()
-            if self.auth_url and device:
-                await asyncio.to_thread(
-                    post_event,
-                    self.auth_url,
-                    {
-                        "type": "disconnected",
-                        "device_id": device.get("device_id"),
-                        "device_name": device.get("device_name"),
-                        "client": device.get("client"),
-                    },
-                )
-            print("Phone disconnected", flush=True)
+                device = dict(self.active_device)
+                self.active_device = {}
+                await self.mic.stop_player()
+                if self.auth_url and device:
+                    await asyncio.to_thread(
+                        post_event,
+                        self.auth_url,
+                        {
+                            "type": "disconnected",
+                            "device_id": device.get("device_id"),
+                            "device_name": device.get("device_name"),
+                            "client": device.get("client"),
+                        },
+                    )
+                print("Phone disconnected", flush=True)
 
     async def speaker_handler(self, websocket: ServerConnection) -> None:
-        if self.speaker_ws is not None:
-            await websocket.close(4000, "Another phone is already the speaker")
-            return
+        previous = self.speaker_ws
         self.speaker_ws = websocket
+        if previous is not None and previous is not websocket:
+            print("Replacing the previous phone speaker stream", flush=True)
+            try:
+                await previous.close(4000, "replaced")
+            except Exception:
+                pass
         rate = 16000
         device: dict[str, Any] = {}
         try:
@@ -811,23 +821,25 @@ class LanMicServer:
         except Exception as exc:
             print(f"Speaker stream ended: {exc}", flush=True)
         finally:
-            if self.speaker_ws is websocket:
+            if self.speaker_ws is not websocket:
+                print("Previous phone speaker stream released", flush=True)
+            else:
                 self.speaker_ws = None
-            device = dict(self.speaker_device)
-            self.speaker_device = {}
-            await self.speaker.stop_recorder()
-            if self.auth_url and device:
-                await asyncio.to_thread(
-                    post_event,
-                    self.auth_url,
-                    {
-                        "type": "speaker_disconnected",
-                        "device_id": device.get("device_id"),
-                        "device_name": device.get("device_name"),
-                        "client": device.get("client"),
-                    },
-                )
-            print("Phone speaker disconnected", flush=True)
+                device = dict(self.speaker_device)
+                self.speaker_device = {}
+                await self.speaker.stop_recorder()
+                if self.auth_url and device:
+                    await asyncio.to_thread(
+                        post_event,
+                        self.auth_url,
+                        {
+                            "type": "speaker_disconnected",
+                            "device_id": device.get("device_id"),
+                            "device_name": device.get("device_name"),
+                            "client": device.get("client"),
+                        },
+                    )
+                print("Phone speaker disconnected", flush=True)
 
     async def watch_source(self) -> None:
         while True:
