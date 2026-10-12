@@ -31,10 +31,12 @@ DEFAULT_DATA = Path.home() / ".local" / "share" / "lanmic"
 SOURCE_NAME = "LanMic"
 BRIDGE_NAME = "LanMicBridge"
 SOURCE_DESCRIPTION = "Phone microphone"
+SINK_NAME = "PhoneSpeaker"
+SINK_DESCRIPTION = "Phone speaker"
 DEFAULT_PORT = 8766
 DISCOVER_PORT = 8768
 DISCOVER_QUERY = (b"LANMIC?", b"LANMIC")
-HUB_CAPS = ["mic"]
+HUB_CAPS = ["mic", "speaker"]
 
 
 def _is_lan_ip(ip: str) -> bool:
@@ -294,7 +296,11 @@ class PipeWireMic:
 
     def _link_player(self) -> None:
         for _ in range(30):
-            outputs = [p for p in pw_ports("output") if p.startswith("pw-cat:output")]
+            outputs = [
+                p
+                for p in pw_ports("output")
+                if p.startswith("lanmic-player:output") or p.startswith("pw-cat:output")
+            ]
             if outputs:
                 inputs = [p for p in pw_ports("input") if p.startswith(f"{SOURCE_NAME}:input")]
                 dest = inputs[0] if inputs else f"{SOURCE_NAME}:input_MONO"
@@ -305,12 +311,8 @@ class PipeWireMic:
             time.sleep(0.05)
         print("Warning: pw-cat ports not found", flush=True)
 
-    async def start_player(self, rate: int) -> None:
-        await self.stop_player()
-        self.bytes_in = 0
-        self.peak = 0
-        self.last_log = time.monotonic()
-        self.player = await asyncio.create_subprocess_exec(
+    def player_argv(self, rate: int) -> list[str]:
+        return [
             "pw-cat",
             "-p",
             "--raw",
@@ -323,9 +325,19 @@ class PipeWireMic:
             "--media-type", "Audio",
             "--media-category", "Playback",
             "--media-role", "Production",
+            "-P", "node.name=lanmic-player",
             "-P", "node.dont-fallback=true",
             "-P", f"node.latency=256/{rate}",
             "-",
+        ]
+
+    async def start_player(self, rate: int) -> None:
+        await self.stop_player()
+        self.bytes_in = 0
+        self.peak = 0
+        self.last_log = time.monotonic()
+        self.player = await asyncio.create_subprocess_exec(
+            *self.player_argv(rate),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
@@ -376,6 +388,148 @@ class PipeWireMic:
         self.module_ids.clear()
 
 
+class PipeWireSpeaker:
+    def __init__(self) -> None:
+        self.module_ids: list[str] = []
+        self.recorder: asyncio.subprocess.Process | None = None
+        self.bytes_out = 0
+        self.peak = 0
+
+    def create_sink(self) -> None:
+        names = pactl_names("sinks")
+        description = SINK_DESCRIPTION.replace(" ", r"\ ")
+        if SINK_NAME not in names:
+            self.module_ids.append(load_module([
+                "module-null-sink",
+                f"sink_name={SINK_NAME}",
+                (
+                    f"sink_properties=device.description={description} "
+                    "device.class=sound node.virtual=true"
+                ),
+                "channel_map=mono",
+            ]))
+        print(f"PipeWire sink {SINK_NAME} ready", flush=True)
+
+    def sink_present(self) -> bool:
+        return SINK_NAME in pactl_names("sinks")
+
+    def ensure_sink(self) -> bool:
+        if self.sink_present():
+            return False
+        print("PhoneSpeaker PipeWire node missing; recreating", flush=True)
+        self.module_ids.clear()
+        self.create_sink()
+        return True
+
+    def record_target(self) -> str | None:
+        monitor = f"{SINK_NAME}.monitor"
+        if monitor in pactl_names("sources"):
+            return monitor
+        return None
+
+    def wait_monitor(self, timeout: float = 2.0) -> str | None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            target = self.record_target()
+            if target:
+                return target
+            time.sleep(0.05)
+        return None
+
+    def recorder_argv(self, rate: int) -> list[str]:
+        return [
+            "pw-cat",
+            "-r",
+            "--raw",
+            "--rate", str(rate),
+            "--channels", "1",
+            "--channel-map", "MONO",
+            "--format", "s16",
+            "--latency", "20ms",
+            "--target", "0",
+            "--media-type", "Audio",
+            "--media-category", "Capture",
+            "--media-role", "Production",
+            "-P", "node.name=lanmic-speaker",
+            "-P", "node.dont-fallback=true",
+            "-",
+        ]
+
+    def _link_recorder(self) -> None:
+        for _ in range(30):
+            outputs = [p for p in pw_ports("output") if p.startswith(f"{SINK_NAME}:monitor")]
+            inputs = [
+                p
+                for p in pw_ports("input")
+                if p.startswith("lanmic-speaker:input") or p.startswith("pw-cat:input")
+            ]
+            if outputs and inputs:
+                for i, dst in enumerate(inputs):
+                    link_ports(outputs[min(i, len(outputs) - 1)], dst)
+                print(f"Pinned speaker capture to {SINK_NAME}.monitor", flush=True)
+                return
+            time.sleep(0.05)
+        print("Warning: could not pin speaker capture to PhoneSpeaker.monitor", flush=True)
+
+    async def start_recorder(self, rate: int) -> None:
+        await self.stop_recorder()
+        self.bytes_out = 0
+        self.peak = 0
+        await asyncio.to_thread(self.ensure_sink)
+        if not await asyncio.to_thread(self.wait_monitor):
+            print("PhoneSpeaker.monitor missing; refusing to record the default source", flush=True)
+            return
+        self.recorder = await asyncio.create_subprocess_exec(
+            *self.recorder_argv(rate),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.sleep(0.1)
+        if self.recorder.returncode is not None:
+            err = b""
+            if self.recorder.stderr:
+                err = await self.recorder.stderr.read()
+            print(
+                f"pw-cat record failed: {err.decode('utf-8', errors='replace').strip()}",
+                flush=True,
+            )
+            self.recorder = None
+            return
+        await asyncio.to_thread(self._link_recorder)
+        print(f"Recording hub playback from {SINK_NAME}.monitor", flush=True)
+
+    async def read_chunk(self, size: int = 1280) -> bytes:
+        if not self.recorder or not self.recorder.stdout:
+            return b""
+        data = await self.recorder.stdout.read(size)
+        if data:
+            self.bytes_out += len(data)
+            if len(data) >= 2:
+                count = min(len(data) // 2, 480)
+                samples = struct.unpack_from("<" + "h" * count, data)
+                local_peak = max((abs(s) for s in samples), default=0)
+                if local_peak > self.peak:
+                    self.peak = local_peak
+        return data
+
+    async def stop_recorder(self) -> None:
+        proc = self.recorder
+        self.recorder = None
+        if not proc:
+            return
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=1.5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+
+    def destroy_sink(self) -> None:
+        for module_id in reversed(self.module_ids):
+            subprocess.run(["pactl", "unload-module", module_id], check=False)
+        self.module_ids.clear()
+
+
 class LanMicServer:
     def __init__(
         self,
@@ -403,8 +557,11 @@ class LanMicServer:
         self.hub_uuid = hub_uuid
         self.fingerprint = ""
         self.mic = PipeWireMic()
+        self.speaker = PipeWireSpeaker()
         self.active: ServerConnection | None = None
+        self.speaker_ws: ServerConnection | None = None
         self.active_device: dict[str, Any] = {}
+        self.speaker_device: dict[str, Any] = {}
         self.static = {
             "/": (WEB / "index.html", "text/html; charset=utf-8"),
             "/index.html": (WEB / "index.html", "text/html; charset=utf-8"),
@@ -428,6 +585,7 @@ class LanMicServer:
             "ws_port": self.public_ws_port(),
             "https_port": self.port,
             "connected": self.active is not None,
+            "speaker_connected": self.speaker_ws is not None,
             "caps": list(HUB_CAPS),
         }
         if self.fingerprint:
@@ -439,6 +597,9 @@ class LanMicServer:
             if self.active_device:
                 payload["device_id"] = self.active_device.get("device_id")
                 payload["device_name"] = self.active_device.get("device_name")
+            if self.speaker_device:
+                payload["speaker_device_id"] = self.speaker_device.get("device_id")
+                payload["speaker_device_name"] = self.speaker_device.get("device_name")
         return payload
 
     def discover_bytes(self) -> bytes:
@@ -454,7 +615,7 @@ class LanMicServer:
         parsed = urllib.parse.urlparse(request.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
-        if path == "/ws":
+        if path in ("/ws", "/ws/speaker"):
             return None
         if path == "/pair":
             if not self.auth_url:
@@ -488,6 +649,11 @@ class LanMicServer:
                     "playing": self.mic.player is not None,
                     "bytes": self.mic.bytes_in,
                     "peak": self.mic.peak,
+                    "sink": SINK_NAME,
+                    "sink_description": SINK_DESCRIPTION,
+                    "speaker_playing": self.speaker.recorder is not None,
+                    "speaker_bytes": self.speaker.bytes_out,
+                    "speaker_peak": self.speaker.peak,
                 }
             return self._json_response(connection, payload)
         asset = self.static.get(path)
@@ -499,7 +665,18 @@ class LanMicServer:
         response.headers["Cache-Control"] = "no-store"
         return response
 
+    def _ws_path(self, websocket: ServerConnection) -> str:
+        request = getattr(websocket, "request", None)
+        raw = getattr(request, "path", "") if request is not None else ""
+        return urllib.parse.urlparse(str(raw or "")).path
+
     async def handler(self, websocket: ServerConnection) -> None:
+        if self._ws_path(websocket) == "/ws/speaker":
+            await self.speaker_handler(websocket)
+            return
+        await self.mic_handler(websocket)
+
+    async def mic_handler(self, websocket: ServerConnection) -> None:
         if self.active is not None:
             await websocket.close(4000, "Another phone is already streaming")
             return
@@ -579,6 +756,79 @@ class LanMicServer:
                 )
             print("Phone disconnected", flush=True)
 
+    async def speaker_handler(self, websocket: ServerConnection) -> None:
+        if self.speaker_ws is not None:
+            await websocket.close(4000, "Another phone is already the speaker")
+            return
+        self.speaker_ws = websocket
+        rate = 16000
+        device: dict[str, Any] = {}
+        try:
+            first = await websocket.recv()
+            if isinstance(first, bytes):
+                if self.hub_mode():
+                    await websocket.close(4001, "hello required")
+                    return
+            else:
+                hello = parse_hello(first)
+                if self.hub_mode():
+                    caps = hello.get("caps") or ["speaker"]
+                    if "speaker" not in [str(item).lower() for item in caps]:
+                        hello = {**hello, "caps": ["speaker"]}
+                    ok, device = await asyncio.to_thread(authorize_hello, self.auth_url, hello)
+                    if not ok:
+                        await websocket.close(4001, str(device.get("error") or device.get("detail") or "unauthorized"))
+                        return
+                    self.speaker_device = {
+                        "device_id": device.get("device_id"),
+                        "device_name": device.get("device_name") or hello.get("device") or "",
+                        "client": hello.get("client") or "",
+                    }
+                rate = int(hello.get("rate") or 16000)
+                await websocket.send(json.dumps({"type": "ready", "caps": list(HUB_CAPS)}))
+            await self.speaker.start_recorder(rate)
+            print(f"Phone speaker connected ({rate} Hz)", flush=True)
+            if self.auth_url:
+                await asyncio.to_thread(
+                    post_event,
+                    self.auth_url,
+                    {
+                        "type": "speaker_connected",
+                        "device_id": self.speaker_device.get("device_id"),
+                        "device_name": self.speaker_device.get("device_name"),
+                        "client": self.speaker_device.get("client"),
+                        "rate": rate,
+                    },
+                )
+            while True:
+                chunk = await self.speaker.read_chunk()
+                if not chunk:
+                    if self.speaker.recorder and self.speaker.recorder.returncode is not None:
+                        break
+                    await asyncio.sleep(0.02)
+                    continue
+                await websocket.send(chunk)
+        except Exception as exc:
+            print(f"Speaker stream ended: {exc}", flush=True)
+        finally:
+            if self.speaker_ws is websocket:
+                self.speaker_ws = None
+            device = dict(self.speaker_device)
+            self.speaker_device = {}
+            await self.speaker.stop_recorder()
+            if self.auth_url and device:
+                await asyncio.to_thread(
+                    post_event,
+                    self.auth_url,
+                    {
+                        "type": "speaker_disconnected",
+                        "device_id": device.get("device_id"),
+                        "device_name": device.get("device_name"),
+                        "client": device.get("client"),
+                    },
+                )
+            print("Phone speaker disconnected", flush=True)
+
     async def watch_source(self) -> None:
         while True:
             await asyncio.sleep(2)
@@ -586,11 +836,13 @@ class LanMicServer:
                 recreated = await asyncio.to_thread(self.mic.ensure_source)
                 if recreated and self.mic.player:
                     await asyncio.to_thread(self.mic._link_player)
+                await asyncio.to_thread(self.speaker.ensure_sink)
             except Exception as exc:
                 print(f"Source watch: {exc}", flush=True)
 
     async def run(self) -> None:
         self.mic.create_source()
+        self.speaker.create_sink()
         if self.set_default:
             subprocess.run(["pactl", "set-default-source", SOURCE_NAME], check=False)
         ip = wait_lan_ip()

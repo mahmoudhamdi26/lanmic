@@ -114,5 +114,6 @@ def test_info_marks_hub_kind_and_public_tls_port(tmp_path):
     assert info["hub_uuid"] == "11111111-1111-1111-1111-111111111111"
     assert info["ws_port"] == 8766
     assert info["https_port"] == 8766
-    assert info["caps"] == ["mic"]
+    assert info["caps"] == ["mic", "speaker"]
+    assert info["speaker_connected"] is False
     assert server.hub_mode() is True
