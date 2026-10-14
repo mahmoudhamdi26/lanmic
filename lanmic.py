@@ -357,7 +357,7 @@ class PipeWireMic:
                 self.peak = local_peak
         transport = getattr(self.player.stdin, "transport", None)
         queued = transport.get_write_buffer_size() if transport else 0
-        if queued > 960:
+        if queued > 2880:
             return
         self.player.stdin.write(pcm)
         now = time.monotonic()
@@ -445,7 +445,7 @@ class PipeWireSpeaker:
             "--channels", "1",
             "--channel-map", "MONO",
             "--format", "s16",
-            "--latency", "20ms",
+            "--latency", "10ms",
             "--target", "0",
             "--media-type", "Audio",
             "--media-category", "Capture",
@@ -498,7 +498,7 @@ class PipeWireSpeaker:
         await asyncio.to_thread(self._link_recorder)
         print(f"Recording hub playback from {SINK_NAME}.monitor", flush=True)
 
-    async def read_chunk(self, size: int = 1280) -> bytes:
+    async def read_chunk(self, size: int = 640) -> bytes:
         if not self.recorder or not self.recorder.stdout:
             return b""
         data = await self.recorder.stdout.read(size)
@@ -670,6 +670,18 @@ class LanMicServer:
         raw = getattr(request, "path", "") if request is not None else ""
         return urllib.parse.urlparse(str(raw or "")).path
 
+    def _set_tcp_nodelay(self, websocket: ServerConnection) -> None:
+        transport = getattr(websocket, "transport", None)
+        if transport is None:
+            return
+        sock = transport.get_extra_info("socket")
+        if sock is None:
+            return
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
     async def handler(self, websocket: ServerConnection) -> None:
         if self._ws_path(websocket) == "/ws/speaker":
             await self.speaker_handler(websocket)
@@ -677,6 +689,7 @@ class LanMicServer:
         await self.mic_handler(websocket)
 
     async def mic_handler(self, websocket: ServerConnection) -> None:
+        self._set_tcp_nodelay(websocket)
         previous = self.active
         self.active = websocket
         if previous is not None and previous is not websocket:
@@ -763,6 +776,7 @@ class LanMicServer:
                 print("Phone disconnected", flush=True)
 
     async def speaker_handler(self, websocket: ServerConnection) -> None:
+        self._set_tcp_nodelay(websocket)
         previous = self.speaker_ws
         self.speaker_ws = websocket
         if previous is not None and previous is not websocket:
@@ -815,7 +829,7 @@ class LanMicServer:
                 if not chunk:
                     if self.speaker.recorder and self.speaker.recorder.returncode is not None:
                         break
-                    await asyncio.sleep(0.02)
+                    await asyncio.sleep(0.005)
                     continue
                 await websocket.send(chunk)
         except Exception as exc:
