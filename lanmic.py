@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import array
 import asyncio
 import base64
 import json
+import os
 import shutil
 import signal
 import socket
@@ -14,6 +16,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -37,6 +40,71 @@ DEFAULT_PORT = 8766
 DISCOVER_PORT = 8768
 DISCOVER_QUERY = (b"LANMIC?", b"LANMIC")
 HUB_CAPS = ["mic", "speaker"]
+# Phone AGC often parks the stream at int16 full scale. Clipped PCM wrecks
+# OpenWakeWord on the hub (near-miss, then a late hit once a lucky frame scores).
+MIC_TARGET_PEAK = 12000
+MIC_CLIP_START = 20000
+MIC_MIN_GAIN = 0.15
+MIC_GAIN_HOLD_SEC = 12.0
+MIC_GAIN_RECOVER_STEP = 0.002
+MIC_GAIN_STATE_FILE = "mic_in_gain.txt"
+# Same path the voice assistant reads. Raw s16le mono at 16 kHz, after gain,
+# so the assistant does not recapture this stream through the 48 kHz ALSA device.
+PHONE_PCM_RATE = 16000
+
+
+def phone_pcm_socket_path() -> Path:
+    override = os.environ.get("SAMOX_PHONE_PCM_SOCK", "").strip()
+    if override:
+        return Path(override)
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if not runtime:
+        runtime = f"/run/user/{os.getuid()}"
+    return Path(runtime) / "samox-phone-mic.sock"
+
+
+def _apply_pcm_gain(pcm: bytes, gain: float) -> bytes:
+    if gain >= 0.999 or len(pcm) < 2:
+        return pcm
+    n = len(pcm) - (len(pcm) % 2)
+    try:
+        import numpy as np
+
+        samples = np.frombuffer(pcm, dtype="<i2", count=n // 2)
+        out = np.clip(samples.astype(np.float32) * float(gain), -32768, 32767).astype("<i2")
+        return out.tobytes()
+    except Exception:
+        samples = array.array("h")
+        samples.frombytes(pcm[:n])
+        g = float(gain)
+        for i, sample in enumerate(samples):
+            value = int(sample * g)
+            if value > 32767:
+                value = 32767
+            elif value < -32768:
+                value = -32768
+            samples[i] = value
+        return samples.tobytes()
+
+
+def _load_mic_gain(path: Path | None) -> float:
+    if path is None or not path.exists():
+        return 1.0
+    try:
+        value = float(path.read_text().strip())
+    except (OSError, ValueError):
+        return 1.0
+    return max(MIC_MIN_GAIN, min(1.0, value))
+
+
+def _save_mic_gain(path: Path | None, gain: float) -> None:
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{max(MIC_MIN_GAIN, min(1.0, float(gain))):.4f}\n")
+    except OSError:
+        pass
 
 
 def _is_lan_ip(ip: str) -> bool:
@@ -240,13 +308,114 @@ def link_ports(src: str, dst: str) -> None:
     subprocess.run(["pw-link", src, dst], check=False, capture_output=True)
 
 
+class PhonePcmFanout:
+    """Hand the same 16 kHz PCM to the assistant without a PipeWire recapture.
+
+    One local client. A full send buffer drops that chunk instead of letting
+    old audio pile up. The virtual LanMic source is still fed for everything
+    else that opens it.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path or phone_pcm_socket_path()
+        self._clients: list[socket.socket] = []
+        self._lock = threading.Lock()
+        self._server: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        if self.path.exists():
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(self.path))
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+        server.listen(1)
+        server.settimeout(0.5)
+        self._server = server
+        self._thread = threading.Thread(target=self._accept_loop, name="phone-pcm-fanout", daemon=True)
+        self._thread.start()
+        print(f"Phone PCM fanout listening on {self.path}", flush=True)
+
+    def _accept_loop(self) -> None:
+        server = self._server
+        if server is None:
+            return
+        while True:
+            try:
+                client, _addr = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            client.setblocking(False)
+            with self._lock:
+                previous = self._clients
+                self._clients = [client]
+            for old in previous:
+                try:
+                    old.close()
+                except OSError:
+                    pass
+
+    def send(self, pcm: bytes) -> None:
+        if not pcm:
+            return
+        with self._lock:
+            clients = list(self._clients)
+        dead: list[socket.socket] = []
+        for client in clients:
+            view = memoryview(pcm)
+            try:
+                while view:
+                    try:
+                        sent = client.send(view)
+                    except BlockingIOError:
+                        break
+                    if sent <= 0:
+                        dead.append(client)
+                        break
+                    view = view[sent:]
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                dead.append(client)
+        if not dead:
+            return
+        with self._lock:
+            for client in dead:
+                if client in self._clients:
+                    self._clients.remove(client)
+                try:
+                    client.close()
+                except OSError:
+                    pass
+
+
 class PipeWireMic:
-    def __init__(self) -> None:
+    def __init__(self, gain_state_path: Path | None = None) -> None:
         self.module_ids: list[str] = []
         self.player: asyncio.subprocess.Process | None = None
+        self.player_rate = 0
+        self.pcm_fanout = PhonePcmFanout()
         self.bytes_in = 0
         self.peak = 0
         self.last_log = 0.0
+        self._gain_state_path = gain_state_path
+        self._in_gain = _load_mic_gain(gain_state_path)
+        self._logged_gain = self._in_gain
+        # Treat a restored attenuated gain as a fresh clip hold so quiet
+        # reconnect audio cannot walk gain back to 1.0 in a few seconds.
+        self._last_clip_at = time.monotonic() if self._in_gain < 0.99 else 0.0
+        self._last_gain_save = 0.0
+        if self._in_gain < 0.99:
+            print(f"LanMic input gain restored at {self._in_gain:.2f}", flush=True)
 
     def create_source(self) -> None:
         names = pactl_names("sinks") | pactl_names("sources")
@@ -333,6 +502,9 @@ class PipeWireMic:
 
     async def start_player(self, rate: int) -> None:
         await self.stop_player()
+        self.player_rate = int(rate)
+        if self.player_rate == PHONE_PCM_RATE:
+            self.pcm_fanout.start()
         self.bytes_in = 0
         self.peak = 0
         self.last_log = time.monotonic()
@@ -349,21 +521,54 @@ class PipeWireMic:
         if not self.player or not self.player.stdin:
             raise RuntimeError("PipeWire player is not running")
         self.bytes_in += len(pcm)
+        now = time.monotonic()
+        local_peak = 0
         if len(pcm) >= 2:
             count = min(len(pcm) // 2, 480)
             samples = struct.unpack_from("<" + "h" * count, pcm)
             local_peak = max((abs(s) for s in samples), default=0)
             if local_peak > self.peak:
                 self.peak = local_peak
+            if local_peak >= MIC_CLIP_START:
+                needed = MIC_TARGET_PEAK / float(max(local_peak, 1))
+                new_gain = min(self._in_gain, max(MIC_MIN_GAIN, needed))
+                # Always refresh the hold on clip, even when gain is already
+                # parked — otherwise quiet gaps between clipped bursts walk
+                # gain back to 1.0 and the next utterance clips again.
+                self._last_clip_at = now
+                if new_gain + 0.005 < self._in_gain:
+                    self._in_gain = new_gain
+                    if now - self._last_gain_save >= 2.0:
+                        _save_mic_gain(self._gain_state_path, self._in_gain)
+                        self._last_gain_save = now
+            elif (
+                self._in_gain < 1.0
+                and local_peak < MIC_TARGET_PEAK * 0.45
+                and self._last_clip_at > 0.0
+                and now - self._last_clip_at >= MIC_GAIN_HOLD_SEC
+            ):
+                # Slow recovery only after a long quiet stretch — fast ramp
+                # was walking gain back to 1.0 between clipped bursts.
+                self._in_gain = min(1.0, self._in_gain + MIC_GAIN_RECOVER_STEP)
+                if self._in_gain >= 0.995:
+                    self._in_gain = 1.0
+                    _save_mic_gain(self._gain_state_path, self._in_gain)
+                    self._last_gain_save = now
+        out = _apply_pcm_gain(pcm, self._in_gain)
+        if self.player_rate == PHONE_PCM_RATE:
+            self.pcm_fanout.send(out)
         transport = getattr(self.player.stdin, "transport", None)
         queued = transport.get_write_buffer_size() if transport else 0
         if queued > 2880:
             return
-        self.player.stdin.write(pcm)
-        now = time.monotonic()
+        self.player.stdin.write(out)
         if now - self.last_log >= 2:
+            gain_note = ""
+            if abs(self._in_gain - self._logged_gain) >= 0.02 or self._in_gain < 0.99:
+                gain_note = f", gain={self._in_gain:.2f}"
+                self._logged_gain = self._in_gain
             print(
-                f"Audio from phone: {self.bytes_in} bytes, peak={self.peak}",
+                f"Audio from phone: {self.bytes_in} bytes, peak={self.peak}{gain_note}",
                 flush=True,
             )
             self.peak = 0
@@ -556,7 +761,7 @@ class LanMicServer:
         self.display_name = name or socket.gethostname()
         self.hub_uuid = hub_uuid
         self.fingerprint = ""
-        self.mic = PipeWireMic()
+        self.mic = PipeWireMic(gain_state_path=self.data_dir / MIC_GAIN_STATE_FILE)
         self.speaker = PipeWireSpeaker()
         self.active: ServerConnection | None = None
         self.speaker_ws: ServerConnection | None = None
